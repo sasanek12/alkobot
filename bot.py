@@ -5,10 +5,11 @@ import datetime
 from datetime import timezone, timedelta
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 
-# --------------------------------------
-# KONFIGURACJA
-# --------------------------------------
+# ---------------------------------------------
+# KONFIGURACJA I STAŁE
+# ---------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
@@ -20,9 +21,9 @@ DATA_FILE = "data.json"
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
-intents.members = True  # Pamiętaj też o włączeniu w panelu Discord: Server Members Intent
+intents.members = True  # Pamiętaj o włączeniu w panelu Discord: Privileged Gateway Intents
 
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents,help_command=None)
 
 VALID_TYPES = {"piwo", "wodka", "whiskey", "inne", "blunt"}
 EMOJI_TO_TYPE = {
@@ -34,16 +35,16 @@ EMOJI_TO_TYPE = {
 }
 TYPE_TO_EMOJI = {v: k for k, v in EMOJI_TO_TYPE.items()}
 
-# --------------------------------------
-# DANE W PAMIĘCI
-# --------------------------------------
-user_statuses = {}           # { user_id: { ... } }
-status_message_id = None     # ID wiadomości z "init_status_message"
-listening_channel_id = None  # None -> bot słucha w każdym kanale
+# ---------------------------------------------
+# DANE I ZMIENNE
+# ---------------------------------------------
+user_statuses = {}           # {user_id: {...}}
+status_message_id = None     # do init_status_message
+listening_channel_id = None  # None => bot słucha wszędzie
 
-# --------------------------------------
+# ---------------------------------------------
 # PLIKI JSON
-# --------------------------------------
+# ---------------------------------------------
 def ensure_data_file_exists():
     if not os.path.exists(DATA_FILE):
         logging.info(f"Plik {DATA_FILE} nie istnieje. Tworzę nowy.")
@@ -105,9 +106,9 @@ def save_data():
     except OSError as e:
         logging.error(f"Błąd zapisu do {DATA_FILE}: {e}")
 
-# --------------------------------------
-# POMOCNICZE
-# --------------------------------------
+# ---------------------------------------------
+# FUNKCJE POMOCNICZE
+# ---------------------------------------------
 def create_new_status(original_nick: str) -> dict:
     return {
         "original_nick": original_nick,
@@ -137,7 +138,7 @@ def ensure_monthly_record(data: dict, month: str):
 
 def build_usage_string(status_data: dict) -> str:
     """
-    Zwraca skróconą formę np. 🍺5🥃2 (bez dwukropków i spacji).
+    Skrócona forma np. 🍺5🥃2.
     """
     parts = []
     for typ in VALID_TYPES:
@@ -149,8 +150,7 @@ def build_usage_string(status_data: dict) -> str:
 
 async def update_nickname(member: discord.Member):
     """
-    Modyfikuje pseudonim membera, np. z "nick" na "nick 🍺5🥃2".
-    Długość max 32 znaki (Discord limit).
+    Modyfikuje pseudonim, np. "nick" na "nick 🍺5🥃2".
     """
     data = user_statuses.get(member.id)
     if not data:
@@ -160,10 +160,7 @@ async def update_nickname(member: discord.Member):
     data["original_nick"] = original_nick
 
     usage_str = build_usage_string(data)
-    if usage_str:
-        new_nick = f"{original_nick} {usage_str}"
-    else:
-        new_nick = original_nick
+    new_nick = f"{original_nick} {usage_str}" if usage_str else original_nick
 
     if len(new_nick) > 32:
         new_nick = new_nick[:31] + "…"
@@ -171,21 +168,15 @@ async def update_nickname(member: discord.Member):
     try:
         await member.edit(nick=new_nick)
     except (discord.Forbidden, discord.HTTPException) as e:
-        logging.warning(f"Nie udało się zmienić pseudonimu {member.name}: {e}")
+        logging.warning(f"Nie udało się zmienić nicku {member.name}: {e}")
 
 def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Member:
     """
-    Pomocnicza funkcja do znalezienia użytkownika po:
-    - wzmiance (np. <@123456789>)
-    - ID
-    - nazwie widocznej lub nicku
-    Zwraca Member lub None, jeśli nie znajdziemy.
+    Znajduje użytkownika po wzmiance (np. <@123>), ID lub nazwie/nicku.
     """
     if not guild:
         return None
 
-    # 1) Najpierw sprawdzamy, czy to ID lub wzmianka
-    #    Przykładowa wzmianka: "<@12345678>"
     mention_id = None
     if name_or_mention.startswith("<@") and name_or_mention.endswith(">"):
         mention_id_str = name_or_mention.strip("<@!>")
@@ -197,28 +188,73 @@ def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Me
     if mention_id is not None:
         return guild.get_member(mention_id)
 
-    # 2) Wyszukiwanie po nazwie/nicku
     name_lower = name_or_mention.lower()
     for member in guild.members:
-        # sprawdzamy nazwy: member.name lub member.nick
         if member.name.lower() == name_lower:
             return member
         if member.nick and member.nick.lower() == name_lower:
             return member
-
     return None
 
 def can_add_for_others(member: discord.Member) -> bool:
     """
-    Zwraca True, jeśli member ma uprawnienie Manage Nicknames LUB jest administratorem.
+    Zwraca True, jeśli member ma uprawnienie Manage Nicknames lub jest administratorem.
     """
     if member.guild_permissions.administrator:
         return True
     return member.guild_permissions.manage_nicknames
 
-# --------------------------------------
-# EVENT: on_ready i pętla czyszcząca
-# --------------------------------------
+def can_clear_others(member: discord.Member) -> bool:
+    """
+    Zwraca True, jeśli member ma uprawnienie Manage Nicknames lub jest administratorem.
+    """
+    if member.guild_permissions.administrator:
+        return True
+    return member.guild_permissions.manage_nicknames
+
+# ---------------------------------------------
+# BUDOWANIE TEKSTU LEADERBOARD
+# ---------------------------------------------
+def build_leaderboard_text(guild: discord.Guild) -> str:
+    current_month = get_current_month()
+    usage_list = []
+
+    # Zbieramy dane z user_statuses
+    for user_id, data in user_statuses.items():
+        monthly_data = data.get("monthly_usage", {})
+        stats = monthly_data.get(current_month, {})
+        total_used = sum(stats.values())
+        if total_used > 0:
+            usage_list.append((user_id, stats, total_used))
+
+    # Sort malejąco
+    usage_list.sort(key=lambda x: x[2], reverse=True)
+
+    if not usage_list:
+        return f"Nikt nie ma punktów w miesiącu {current_month}."
+
+    lines = []
+    position = 1
+    for user_id, stats, total_used in usage_list:
+        member = guild.get_member(user_id)
+        mention_str = member.mention if member else f"<@{user_id}>"
+
+        detail_parts = []
+        for t in VALID_TYPES:
+            val = stats.get(t, 0)
+            if val > 0:
+                detail_parts.append(f"{TYPE_TO_EMOJI[t]}{val}")
+        detail_str = "".join(detail_parts) or "Brak"
+
+        lines.append(f"**{position})** {mention_str} ({detail_str}) - Suma: {total_used}")
+        position += 1
+
+    leaderboard_text = "\n".join(lines)
+    return f"**Tabela wyników za {current_month}**:\n{leaderboard_text}"
+
+# ---------------------------------------------
+# EVENT on_ready i pętla czyszcząca
+# ---------------------------------------------
 @bot.event
 async def on_ready():
     logging.info(f"Zalogowano jako {bot.user}")
@@ -244,9 +280,9 @@ async def clean_statuses():
     if to_remove:
         save_data()
 
-# --------------------------------------
-# EVENT: on_message - filtr kanału
-# --------------------------------------
+# ---------------------------------------------
+# EVENT: on_message (filtr kanału)
+# ---------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -255,26 +291,24 @@ async def on_message(message: discord.Message):
         return
     await bot.process_commands(message)
 
-# --------------------------------------
-# KOMENDY
-# --------------------------------------
-
+# ---------------------------------------------
+# KOMENDY .HELP i /HELP
+# ---------------------------------------------
 def get_help_text() -> str:
-    """
-    Treść pomocy w jednym miejscu (wykorzystywana zarówno przez .help, jak i /help).
-    """
     return (
         f"**Komendy (prefix: {BOT_PREFIX})**:\n"
         f"{BOT_PREFIX}help - Wyświetla tę pomoc\n"
         f"{BOT_PREFIX}add <typ> <ilość> - Dodaje do Twojego statusu\n"
-        f"{BOT_PREFIX}add <nick> <typ> <ilość> - Dodaje do czyjegoś statusu\n"
+        f"{BOT_PREFIX}add <nick> <typ> <ilość> - Dodaje do cudzego statusu (wymaga Manage Nicknames / Admin)\n"
         f"{BOT_PREFIX}status - Wyświetla Twój status\n"
-        f"{BOT_PREFIX}clear - Czyści Twój status\n"
-        f"{BOT_PREFIX}leaderboard - Wyświetla tabelę wyników\n"
+        f"{BOT_PREFIX}clear [<nick>] - Czyści Twój status lub czyjś (Manage Nicknames / Admin)\n"
+        f"{BOT_PREFIX}leaderboard [hide] - Wyświetla tabelę wyników; z 'hide' wyśle w DM\n"
         f"{BOT_PREFIX}init_status_message - Tworzy wiadomość z reakcjami\n"
         f"{BOT_PREFIX}setchannel <kanał> - Ustawia kanał nasłuchu (admin)\n\n"
-        "**Slash commands**: /ping, /help\n"
-        "Jeśli nie ustawisz kanału, bot słucha w każdym kanale."
+        "**Slash commands**:\n"
+        "/leaderboard (hide=False) - publicznie, (hide=True) - ephemeral\n"
+        "/help - pokazuje tę pomoc\n"
+        "/ping - test ping\n"
     )
 
 @bot.command(name="help")
@@ -285,6 +319,78 @@ async def help_cmd(ctx: commands.Context):
 async def help_slash_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(get_help_text())
 
+# ---------------------------------------------
+# KOMENDA .ADD
+# ---------------------------------------------
+@bot.command()
+async def add(ctx: commands.Context, *args):
+    """
+    .add <typ> <ilość> - dodaje do Twojego statusu
+    .add <nick> <typ> <ilość> - dodaje do cudzego statusu (wymaga Manage Nicknames / Admin)
+    """
+    if not ctx.guild:
+        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
+        return
+
+    if len(args) == 2:
+        typ, ilosc_str = args
+        member = ctx.guild.get_member(ctx.author.id)
+    elif len(args) == 3:
+        name_or_mention, typ, ilosc_str = args
+        # SPRAWDZAMY UPRAWNIENIA
+        if not can_add_for_others(ctx.author):
+            await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by dodawać innym.")
+            return
+        member = find_user_in_guild(ctx.guild, name_or_mention)
+        if member is None:
+            await ctx.send(f"Nie znaleziono użytkownika: {name_or_mention}")
+            return
+    else:
+        await ctx.send("Poprawne użycie: .add <typ> <ilość> lub .add <nick> <typ> <ilość>")
+        return
+
+    try:
+        ilosc = int(ilosc_str)
+    except ValueError:
+        await ctx.send("Podaj liczbę jako ilość, np. .add piwo 2 lub .add @Marcin piwo 2")
+        return
+
+    typ = typ.lower()
+    if typ not in VALID_TYPES:
+        await ctx.send(f"Nieznany typ! Dozwolone: {', '.join(VALID_TYPES)}.")
+        return
+
+    if member.id not in user_statuses:
+        user_statuses[member.id] = create_new_status(member.nick or member.name)
+
+    data = user_statuses[member.id]
+    data[typ] += ilosc
+    data["expires"] = datetime.datetime.now(timezone.utc) + timedelta(hours=8)
+
+    month = get_current_month()
+    ensure_monthly_record(data, month)
+    data["monthly_usage"][month][typ] += ilosc
+
+    if member.id == ctx.author.id:
+        await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {ctx.author.mention}.")
+    else:
+        await ctx.send(
+            f"Dodano **{ilosc}** do **{typ}** dla użytkownika {member.mention} (wywołane przez {ctx.author.mention})."
+        )
+    await update_nickname(member)
+    save_data()
+
+@add.error
+async def add_error(ctx: commands.Context, error):
+    logging.error(f"Błąd w komendzie .add: {error}")
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("Podaj liczbę jako ilość, np. `.add piwo 2`.")
+    else:
+        await ctx.send(f"Wystąpił błąd: {error}")
+
+# ---------------------------------------------
+# KOMENDA .STATUS
+# ---------------------------------------------
 @bot.command()
 async def status(ctx: commands.Context):
     data = user_statuses.get(ctx.author.id)
@@ -308,17 +414,20 @@ async def status(ctx: commands.Context):
     )
     await ctx.send(msg)
 
+# ---------------------------------------------
+# KOMENDA .CLEAR
+# ---------------------------------------------
 @bot.command()
 async def clear(ctx: commands.Context, user_arg: str = None):
     """
     .clear - czyści Twój status
-    .clear <nick> - czyści czyjś status (tylko dla osób z uprawnieniem Manage Nicknames lub admin)
+    .clear <nick> - czyści czyjś status (Manage Nicknames / Admin)
     """
     if not ctx.guild:
         await ctx.send("Ta komenda działa tylko na serwerze (guild).")
         return
 
-    # --- 1) Bez argumentu -> Czyścimy swój status ---
+    # 1) Bez argumentu -> czyści własny status
     if user_arg is None:
         if ctx.author.id not in user_statuses:
             await ctx.send("Nie masz obecnie żadnego statusu do wyczyszczenia.")
@@ -339,9 +448,8 @@ async def clear(ctx: commands.Context, user_arg: str = None):
         save_data()
         return
 
-    # --- 2) Z argumentem -> próba wyczyszczenia czyjegoś statusu ---
-    # Sprawdzamy, czy użytkownik ma uprawnienie do czyszczenia cudzego statusu
-    if not can_add_for_others(ctx.author):
+    # 2) Z argumentem -> czyścimy status innego usera (wymaga Manage Nicknames / Admin)
+    if not can_clear_others(ctx.author):
         await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by czyścić statusy innych.")
         return
 
@@ -366,18 +474,52 @@ async def clear(ctx: commands.Context, user_arg: str = None):
     await ctx.send(f"Status użytkownika {target.mention} został wyczyszczony (wywołane przez {ctx.author.mention}).")
     save_data()
 
-
-@bot.command()
-async def setchannel(ctx: commands.Context, channel: discord.TextChannel):
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("Tylko administrator może to zrobić.")
+# ---------------------------------------------
+# KOMENDA .LEADERBOARD [HIDE]
+# ---------------------------------------------
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx: commands.Context, hide_arg: str = None):
+    """
+    .leaderboard [hide]
+      - bez hide -> wyniki publiczne
+      - z hide  -> wyniki w DM
+    """
+    if not ctx.guild:
+        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
         return
 
-    global listening_channel_id
-    listening_channel_id = channel.id
-    save_data()
-    await ctx.send(f"Ustawiono kanał nasłuchu na {channel.mention}.")
+    leaderboard_text = build_leaderboard_text(ctx.guild)
 
+    if hide_arg == "hide":
+        # Wysyłamy na priv
+        try:
+            await ctx.author.send(leaderboard_text)
+            await ctx.send(f"Sprawdź prywatną wiadomość, {ctx.author.mention}!")
+        except discord.Forbidden:
+            await ctx.send(f"Nie mogę wysłać prywatnej wiadomości do {ctx.author.mention}.")
+    else:
+        # Publicznie
+        await ctx.send(leaderboard_text)
+
+# ---------------------------------------------
+# SLASH: /LEADERBOARD (hide: bool)
+# ---------------------------------------------
+@bot.tree.command(name="leaderboard", description="Wyświetla tabelę wyników")
+@app_commands.describe(
+    hide="Czy wiadomość ma być wysłana dyskretnie (ephemeral)? Domyślnie: False."
+)
+async def leaderboard_slash(interaction: discord.Interaction, hide: bool = False):
+    if not interaction.guild:
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze (guild).", ephemeral=True)
+        return
+
+    leaderboard_text = build_leaderboard_text(interaction.guild)
+    # ephemeral = hide => jeśli hide=True, wiadomość jest ukryta, widoczna tylko dla wywołującego
+    await interaction.response.send_message(content=leaderboard_text, ephemeral=hide)
+
+# ---------------------------------------------
+# KOMENDA .INIT_STATUS_MESSAGE
+# ---------------------------------------------
 @bot.command()
 async def init_status_message(ctx: commands.Context):
     global status_message_id
@@ -398,125 +540,23 @@ async def init_status_message(ctx: commands.Context):
         await message.add_reaction(emoji)
     await message.add_reaction("❌")
 
-@bot.command(name="leaderboard")
-async def leaderboard_cmd(ctx: commands.Context):
-    if not ctx.guild:
-        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
-        return
-
-    current_month = get_current_month()
-    usage_list = []
-
-    for user_id, data in user_statuses.items():
-        monthly_data = data.get("monthly_usage", {})
-        stats = monthly_data.get(current_month, {})
-        total_used = sum(stats.values())
-        if total_used > 0:
-            usage_list.append((user_id, stats, total_used))
-
-    usage_list.sort(key=lambda x: x[2], reverse=True)
-
-    if not usage_list:
-        await ctx.send(f"Nikt nie ma punktów w miesiącu {current_month}.")
-        return
-
-    lines = []
-    position = 1
-    for user_id, stats, total_used in usage_list:
-        member = ctx.guild.get_member(user_id)
-        mention_str = member.mention if member else f"<@{user_id}>"
-        detail_parts = []
-        for t in VALID_TYPES:
-            val = stats.get(t, 0)
-            if val > 0:
-                detail_parts.append(f"{TYPE_TO_EMOJI[t]}{val}")
-        detail_str = "".join(detail_parts) or "Brak"
-        lines.append(f"**{position})** {mention_str} ({detail_str}) - Suma: {total_used}")
-        position += 1
-
-    leaderboard_text = "\n".join(lines)
-    await ctx.send(f"**Tabela wyników za {current_month}**:\n{leaderboard_text}")
-
-# --------------------------------------
-# NOWA KOMENDA .add
-# --------------------------------------
+# ---------------------------------------------
+# KOMENDA .SETCHANNEL
+# ---------------------------------------------
 @bot.command()
-async def add(ctx: commands.Context, *args):
-    """
-    .add <typ> <ilość> - dodaje do Twojego statusu
-    .add <nick> <typ> <ilość> - dodaje do cudzego statusu (wymaga uprawnień Manage Nicknames lub admina)
-    """
-    if not ctx.guild:
-        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
+async def setchannel(ctx: commands.Context, channel: discord.TextChannel):
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("Tylko administrator może to zrobić.")
         return
 
-    if len(args) == 2:
-        # .add <typ> <ilosc> => dodawanie do statusu autora
-        typ, ilosc_str = args
-        member = ctx.guild.get_member(ctx.author.id)
-
-    elif len(args) == 3:
-        # .add <nick> <typ> <ilosc> => dodawanie do statusu kogoś innego
-        name_or_mention, typ, ilosc_str = args
-
-        # SPRAWDZENIE UPRAWNIEŃ
-        if not can_add_for_others(ctx.author):
-            await ctx.send("Nie masz wystarczających uprawnień (Manage Nicknames / Admin), by dodać innym!")
-            return
-
-        member = find_user_in_guild(ctx.guild, name_or_mention)
-        if member is None:
-            await ctx.send(f"Nie znaleziono użytkownika: {name_or_mention}")
-            return
-    else:
-        await ctx.send("Poprawne użycie: .add <typ> <ilość> lub .add <nick> <typ> <ilość>")
-        return
-
-    # Reszta logiki – konwersja ilosc, sprawdzanie typu, update itp.
-    try:
-        ilosc = int(ilosc_str)
-    except ValueError:
-        await ctx.send("Podaj liczbę jako ilość, np. .add piwo 2 lub .add @Marcin piwo 2")
-        return
-
-    typ = typ.lower()
-    if typ not in VALID_TYPES:
-        await ctx.send(f"Nieznany typ! Dozwolone: {', '.join(VALID_TYPES)}.")
-        return
-
-    # Tworzymy status, jeśli go nie ma
-    if member.id not in user_statuses:
-        user_statuses[member.id] = create_new_status(member.nick or member.name)
-
-    data = user_statuses[member.id]
-    data[typ] += ilosc
-    data["expires"] = datetime.datetime.now(timezone.utc) + datetime.timedelta(hours=8)
-
-    month = get_current_month()
-    ensure_monthly_record(data, month)
-    data["monthly_usage"][month][typ] += ilosc
-
-    if member.id == ctx.author.id:
-        await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {ctx.author.mention}.")
-    else:
-        await ctx.send(
-            f"Dodano **{ilosc}** do **{typ}** dla użytkownika {member.mention} (wywołane przez {ctx.author.mention})."
-        )
-    await update_nickname(member)
+    global listening_channel_id
+    listening_channel_id = channel.id
     save_data()
+    await ctx.send(f"Ustawiono kanał nasłuchu na {channel.mention}.")
 
-
-@add.error
-async def add_error(ctx: commands.Context, error):
-    logging.error(f"Błąd w komendzie .add: {error}")
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("Podaj liczbę jako ilość, np. `.add piwo 2`.")
-    else:
-        await ctx.send(f"Wystąpił błąd: {error}")
-
-# --------------------------------------
-# OBŁUGA REAKCJI
-# --------------------------------------
+# ---------------------------------------------
+# OBSŁUGA REAKCJI
+# ---------------------------------------------
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     global status_message_id
@@ -528,6 +568,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     guild = reaction.message.guild
     if not guild:
         return
+
     member = guild.get_member(user.id)
     if not member:
         return
@@ -536,7 +577,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if emoji == "❌":
         if member.id in user_statuses:
             data = user_statuses.pop(member.id)
-            original_nick = data.get("original_nick") or member.name
+            original_nick = data.get("original_nick") or (member.nick or member.name)
             if len(original_nick) > 32:
                 original_nick = original_nick[:31] + "…"
             try:
@@ -570,16 +611,16 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     save_data()
     await reaction.remove(user)
 
-# --------------------------------------
-# PRZYKŁADOWY SLASH: /ping
-# --------------------------------------
+# ---------------------------------------------
+# PRZYKŁADOWA KOMENDA /ping
+# ---------------------------------------------
 @bot.tree.command(name="ping", description="Testowa komenda slash – odpowiada 'Pong!'")
 async def ping_slash(interaction: discord.Interaction):
     await interaction.response.send_message("Pong!")
 
-# --------------------------------------
-# START
-# --------------------------------------
+# ---------------------------------------------
+# START BOTA
+# ---------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN", "TWOJ_TOKEN_DISCORDA")
     bot.run(token)
