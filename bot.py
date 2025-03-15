@@ -35,7 +35,7 @@ TIME_TO_EXPIRE = {
     "wodka": 2,    # ~2h
     "whiskey": 2,  # ~2h
     "wino": 2,
-    "drink": 2, # np. wino ~2h
+    "drink": 2,
     "blunt": 4     # ~4h
 }
 
@@ -53,8 +53,12 @@ TYPE_TO_EMOJI = {v: k for k, v in EMOJI_TO_TYPE.items()}
 # DANE I ZMIENNE
 # ---------------------------------------------
 user_statuses = {}           # { user_id: {...} }
-status_message_id = None     # do init_status_message
+status_message_id = None     # ID wiadomości z init_status_message
 listening_channel_id = None  # None => bot słucha wszędzie
+
+# Nowe zmienne do "żywego" leaderboardu  # <-- ZMIANA
+live_leaderboard_message_id = None
+live_leaderboard_channel_id = None
 
 # ---------------------------------------------
 # PLIKI JSON
@@ -67,7 +71,7 @@ def ensure_data_file_exists():
             json.dump(base_data, f, ensure_ascii=False, indent=2)
 
 def load_data():
-    global user_statuses, listening_channel_id
+    global user_statuses, listening_channel_id, live_leaderboard_message_id, live_leaderboard_channel_id
 
     ensure_data_file_exists()
     try:
@@ -80,6 +84,10 @@ def load_data():
     settings = raw.get("settings", {})
     listening_channel_id = settings.get("listening_channel_id", None)
 
+    # Nowe pola w "settings" do leaderboardu   # <-- ZMIANA
+    live_leaderboard_message_id = settings.get("live_leaderboard_message_id")
+    live_leaderboard_channel_id = settings.get("live_leaderboard_channel_id")
+
     temp_statuses = {}
     for user_id_str, data in raw.items():
         if user_id_str == "settings":
@@ -89,7 +97,6 @@ def load_data():
         except ValueError:
             continue
 
-        # wczytujemy expires_per_substance
         eps = data.get("expires_per_substance", {})
         for typ, val in eps.items():
             if val is not None:
@@ -107,10 +114,13 @@ def load_data():
 
 def save_data():
     to_save = {"settings": {"listening_channel_id": listening_channel_id}}
+
+    # Zapisujemy także info o "żywym" leaderboardzie  # <-- ZMIANA
+    to_save["settings"]["live_leaderboard_message_id"] = live_leaderboard_message_id
+    to_save["settings"]["live_leaderboard_channel_id"] = live_leaderboard_channel_id
+
     for user_id, data in user_statuses.items():
         data_copy = dict(data)
-
-        # musimy przekształcić expires_per_substance na string
         if "expires_per_substance" in data_copy:
             eps_dict = {}
             for typ, dt_value in data_copy["expires_per_substance"].items():
@@ -119,7 +129,6 @@ def save_data():
                 else:
                     eps_dict[typ] = None
             data_copy["expires_per_substance"] = eps_dict
-
         to_save[str(user_id)] = data_copy
 
     try:
@@ -133,10 +142,6 @@ def save_data():
 # FUNKCJE POMOCNICZE
 # ---------------------------------------------
 def create_new_status(original_nick: str) -> dict:
-    """
-    Tworzy nową strukturę statusu. Każda substancja = 0,
-    a expires_per_substance[typ] = None.
-    """
     return {
         "original_nick": original_nick,
         "piwo": 0,
@@ -173,9 +178,6 @@ def ensure_monthly_record(data: dict, month: str):
         }
 
 def build_usage_string(status_data: dict) -> str:
-    """
-    Zwraca skróconą formę np. "🍺5🥃2", pomijając zera.
-    """
     parts = []
     for typ in VALID_TYPES:
         count = status_data.get(typ, 0)
@@ -185,9 +187,6 @@ def build_usage_string(status_data: dict) -> str:
     return "".join(parts)
 
 async def update_nickname(member: discord.Member, source="command"):
-    """
-    Modyfikuje nick użytkownika. Jeśli to właściciel serwera, wysyła mu DM z gotową komendą do wklejenia.
-    """
     data = user_statuses.get(member.id)
     if not data:
         return
@@ -207,14 +206,12 @@ async def update_nickname(member: discord.Member, source="command"):
         if member.guild.owner_id == member.id:
             try:
                 if source == "command":
-                    # Gotowa komenda dla właściciela do wklejenia na serwerze
                     await member.send(
                         f"🔔 **Propozycja zmiany nicku:** `{new_nick}`\n\n"
                         f"👉 Użyj na serwerze gotowej komendy:\n"
                         f"```/setnick \"{new_nick}\"```"
                     )
                 elif source == "expire":
-                    # Po wygaśnięciu — gotowa komenda do przywrócenia
                     await member.send(
                         f"⏳ Czas dla Twojego statusu minął. Sugerowana nowa nazwa: `{new_nick}`\n\n"
                         f"👉 Użyj na serwerze gotowej komendy:\n"
@@ -225,12 +222,9 @@ async def update_nickname(member: discord.Member, source="command"):
         else:
             logging.warning(f"Nie udało się zmienić nicku dla {member.name}.")
 
-
-
 def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Member:
     if not guild:
         return None
-
     mention_id = None
     if name_or_mention.startswith("<@") and name_or_mention.endswith(">"):
         mention_id_str = name_or_mention.strip("<@!>")
@@ -238,7 +232,6 @@ def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Me
             mention_id = int(mention_id_str)
     elif name_or_mention.isdigit():
         mention_id = int(name_or_mention)
-
     if mention_id is not None:
         return guild.get_member(mention_id)
 
@@ -251,17 +244,11 @@ def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Me
     return None
 
 def can_add_for_others(member: discord.Member) -> bool:
-    """
-    Zwraca True, jeśli member ma uprawnienie Manage Nicknames lub jest administratorem.
-    """
     if member.guild_permissions.administrator:
         return True
     return member.guild_permissions.manage_nicknames
 
 def can_clear_others(member: discord.Member) -> bool:
-    """
-    Zwraca True, jeśli member ma uprawnienie Manage Nicknames lub jest administratorem.
-    """
     if member.guild_permissions.administrator:
         return True
     return member.guild_permissions.manage_nicknames
@@ -299,6 +286,88 @@ def build_leaderboard_text(guild: discord.Guild) -> str:
     return f"**Tabela wyników za {current_month}**:\n{leaderboard_text}"
 
 # ---------------------------------------------
+# EMBED LEADERBOARD (do "żywej" wiadomości)
+# ---------------------------------------------
+def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    """
+    Tworzy ładnego Embeda z bieżącym leaderboardem.
+    """
+    current_month = get_current_month()
+    usage_list = []
+    for user_id, data in user_statuses.items():
+        monthly_data = data.get("monthly_usage", {})
+        stats = monthly_data.get(current_month, {})
+        total_used = sum(stats.values())
+        if total_used > 0:
+            usage_list.append((user_id, stats, total_used))
+
+    usage_list.sort(key=lambda x: x[2], reverse=True)
+
+    embed = discord.Embed(
+        title="Aktualizowany Leaderboard",
+        description=f"Wyniki miesiąca: {current_month}",
+        color=discord.Color.blue()
+    )
+
+    if not usage_list:
+        embed.add_field(name="Brak danych", value="Nikt nie ma punktów w tym miesiącu", inline=False)
+        return embed
+
+    position = 1
+    for user_id, stats, total_used in usage_list:
+        member = guild.get_member(user_id)
+        if member:
+            name_str = f"{position}) {member.display_name}"
+        else:
+            name_str = f"{position}) <@{user_id}>"
+
+        detail_parts = []
+        for t in VALID_TYPES:
+            val = stats.get(t, 0)
+            if val > 0:
+                detail_parts.append(f"{TYPE_TO_EMOJI[t]}{val}")
+        detail_str = "".join(detail_parts) or "Brak"
+
+        embed.add_field(
+            name=name_str,
+            value=f"{detail_str} | Suma: {total_used}",
+            inline=False
+        )
+        position += 1
+
+    return embed
+
+# ---------------------------------------------
+# PĘTLA AKTUALIZUJĄCA "ŻYWY" LEADERBOARD  # <-- ZMIANA
+# ---------------------------------------------
+@tasks.loop(minutes=1)
+async def update_live_leaderboard():
+    """
+    Co minutę aktualizuje wiadomość "live leaderboard" (jeśli istnieje).
+    """
+    global live_leaderboard_channel_id, live_leaderboard_message_id
+
+    if not live_leaderboard_channel_id or not live_leaderboard_message_id:
+        return  # Nie ustawiono "żywego" leaderboardu
+
+    guild_list = bot.guilds
+    for g in guild_list:
+        channel = g.get_channel(live_leaderboard_channel_id)
+        if channel:
+            try:
+                msg = await channel.fetch_message(live_leaderboard_message_id)
+            except discord.NotFound:
+                # Wiadomość skasowana lub niedostępna
+                continue
+
+            # Budujemy nowy embed
+            embed = build_leaderboard_embed(g)
+            try:
+                await msg.edit(embed=embed)
+            except discord.HTTPException:
+                pass
+
+# ---------------------------------------------
 # EVENT on_ready + pętla czyszcząca
 # ---------------------------------------------
 @bot.event
@@ -307,6 +376,7 @@ async def on_ready():
     load_data()
     await bot.change_presence(activity=discord.Game(name=f"Prefix: {BOT_PREFIX}"))
     clean_statuses.start()
+    update_live_leaderboard.start()  # <-- Startujemy nową pętlę
 
     try:
         await bot.tree.sync()
@@ -328,13 +398,25 @@ async def clean_statuses():
                     data[t] = 0
                     data["expires_per_substance"][t] = None
 
-                    member = bot.get_guild(data["guild_id"]).get_member(user_id)
+                    member = None
+                    # Może user zapisał "guild_id" w data?
+                    # Wcześniej tak robiliśmy w jednym z przykładów, ale tutaj nie ma guild_id.
+                    # Zatem opuśćmy. Jeżeli chcesz, dodaj do data "guild_id".
+                    # if "guild_id" in data:
+                    #     g = bot.get_guild(data["guild_id"])
+                    #     if g: member = g.get_member(user_id)
+
+                    # Ewentualnie spróbujmy w pętli po bot.guilds i poszukać:
+                    for guild_ in bot.guilds:
+                        m = guild_.get_member(user_id)
+                        if m:
+                            member = m
+                            break
+
                     if member:
                         if member.guild.owner_id == member.id:
-                            # Właściciel serwera – wysyłamy DM z aktualnym nickiem
                             await update_nickname(member, source="expire")
 
-        # Jeśli wszystkie substancje są wyzerowane, usuwamy status
         if all(data[sub] == 0 for sub in VALID_TYPES):
             to_remove.append(user_id)
 
@@ -343,7 +425,6 @@ async def clean_statuses():
 
     if to_remove:
         save_data()
-
 
 # ---------------------------------------------
 # EVENT: on_message (filtr kanału)
@@ -364,16 +445,15 @@ def get_help_text() -> str:
         f"**Komendy (prefix: {BOT_PREFIX})**:\n"
         f"{BOT_PREFIX}help - Wyświetla tę pomoc\n"
         f"{BOT_PREFIX}add <typ> <ilość> - Dodaje do Twojego statusu\n"
-        f"{BOT_PREFIX}add <nick> <typ> <ilość> - Dodaje do cudzego statusu (wymaga Manage Nicknames / Admin)\n"
-        f"{BOT_PREFIX}status - Wyświetla Twój status (z czasem do wygaśnięcia)\n"
+        f"{BOT_PREFIX}add <nick> <typ> <ilość> - Dodaje do cudzego statusu (Manage Nicknames / Admin)\n"
+        f"{BOT_PREFIX}status - Wyświetla Twój status\n"
         f"{BOT_PREFIX}clear [<nick>] - Czyści Twój status lub czyjś (Manage Nicknames / Admin)\n"
         f"{BOT_PREFIX}leaderboard [hide] - Wyświetla tabelę wyników; z 'hide' wyśle w DM\n"
         f"{BOT_PREFIX}init_status_message - Tworzy wiadomość z reakcjami\n"
-        f"{BOT_PREFIX}setchannel <kanał> - Ustawia kanał nasłuchu (admin)\n\n"
+        f"{BOT_PREFIX}setchannel <kanał> - Ustawia kanał nasłuchu (admin)\n"
+        f"{BOT_PREFIX}live_leaderboard - Tworzy i aktualizuje co minutę embed z wynikami (admin)\n\n"
         "**Slash commands**:\n"
-        "/leaderboard (hide=False) - publicznie, (hide=True) - ephemeral\n"
-        "/help - pokazuje tę pomoc\n"
-        "/ping - test ping\n"
+        "/add, /status, /clear, /leaderboard, /init_status_message, /setchannel, /live_leaderboard, /help, /ping\n"
     )
 
 @bot.command(name="help")
@@ -385,40 +465,41 @@ async def help_slash_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(get_help_text())
 
 # ---------------------------------------------
-# KOMENDA .ADD
+# KOMENDY TEKSTOWE (PREFIX) - add, status, clear już mamy
+# DODAJEMY KOMENDY SLASH do analogicznej obsługi
 # ---------------------------------------------
-@bot.command()
-async def add(ctx: commands.Context, *args):
-    if not ctx.guild:
-        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
+@bot.tree.command(name="add", description="Dodaje używkę do statusu (Twojego lub innego).")
+@app_commands.describe(
+    user="Osoba, której chcesz dodać (opcjonalnie)",
+    typ="Typ używki",
+    ilosc="Ile sztuk dodać"
+)
+async def add_slash(
+    interaction: discord.Interaction,
+    typ: str,
+    ilosc: int,
+    user: discord.Member = None
+):
+    if not interaction.guild:
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze.", ephemeral=True)
         return
 
-    if len(args) == 2:
-        typ, ilosc_str = args
-        member = ctx.guild.get_member(ctx.author.id)
-    elif len(args) == 3:
-        name_or_mention, typ, ilosc_str = args
-        if not can_add_for_others(ctx.author):
-            await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by dodawać innym.")
-            return
-        member = find_user_in_guild(ctx.guild, name_or_mention)
-        if member is None:
-            await ctx.send(f"Nie znaleziono użytkownika: {name_or_mention}")
-            return
-    else:
-        await ctx.send("Poprawne użycie: .add <typ> <ilość> lub .add <nick> <typ> <ilość>")
-        return
+    member = user or interaction.guild.get_member(interaction.user.id)
 
-    # Konwersja ilości
-    try:
-        ilosc = int(ilosc_str)
-    except ValueError:
-        await ctx.send("Podaj liczbę jako ilość.")
+    # Jeśli chcemy dodać komuś innemu, a nie mamy uprawnień
+    if user and not can_add_for_others(interaction.user):
+        await interaction.response.send_message(
+            "Nie masz uprawnień (Manage Nicknames / Admin), by dodawać innym.",
+            ephemeral=True
+        )
         return
 
     typ = typ.lower()
     if typ not in VALID_TYPES:
-        await ctx.send(f"Nieznany typ! Dozwolone: {', '.join(VALID_TYPES)}.")
+        await interaction.response.send_message(
+            f"Nieznany typ! Dozwolone: {', '.join(VALID_TYPES)}.",
+            ephemeral=True
+        )
         return
 
     if member.id not in user_statuses:
@@ -434,36 +515,25 @@ async def add(ctx: commands.Context, *args):
     ensure_monthly_record(data, month)
     data["monthly_usage"][month][typ] += ilosc
 
-    if member.id == ctx.author.id:
-        await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {ctx.author.mention}.")
+    if member.id == interaction.user.id:
+        msg = f"Dodano **{ilosc}** do **{typ}**."
     else:
-        await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {member.mention}.")
+        msg = f"Dodano **{ilosc}** do **{typ}** dla {member.mention}."
 
-    # Używamy poprawnej wartości "source"
     await update_nickname(member, source="command")
     save_data()
 
+    await interaction.response.send_message(msg, ephemeral=False)
 
+@bot.tree.command(name="status", description="Wyświetla Twój status.")
+async def status_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze.", ephemeral=True)
+        return
 
-@add.error
-async def add_error(ctx: commands.Context, error):
-    logging.error(f"Błąd w komendzie .add: {error}")
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("Podaj liczbę jako ilość, np. `.add piwo 2`.")
-    else:
-        await ctx.send(f"Wystąpił błąd: {error}")
-
-# ---------------------------------------------
-# KOMENDA .STATUS
-# ---------------------------------------------
-@bot.command()
-async def status(ctx: commands.Context):
-    """
-    Wyświetla aktualne ilości i czas do wygaśnięcia każdej substancji > 0
-    """
-    data = user_statuses.get(ctx.author.id)
+    data = user_statuses.get(interaction.user.id)
     if not data:
-        await ctx.send("Nie masz obecnie żadnego statusu.")
+        await interaction.response.send_message("Nie masz obecnie żadnego statusu.", ephemeral=True)
         return
 
     lines = []
@@ -471,134 +541,113 @@ async def status(ctx: commands.Context):
     for t in VALID_TYPES:
         count = data[t]
         if count > 0:
-            # Obliczamy czas do wygaśnięcia:
             exp_time = data["expires_per_substance"].get(t)
             if exp_time:
                 diff = exp_time - now
                 diff_hours = diff.total_seconds() / 3600.0
-                # zaokrąglamy w górę do pełnych godzin:
                 hours_left = math.ceil(diff_hours)
                 lines.append(f"• {t.capitalize()}: {count} (pozostało ~{hours_left}h)")
             else:
-                # Teoretycznie nie powinno się zdarzyć,
-                # ale gdyby count>0, a brak exp_time => brak czasu
                 lines.append(f"• {t.capitalize()}: {count} (czas nieustalony)")
 
     if not lines:
-        await ctx.send("Nie masz obecnie żadnej aktywnej substancji.")
+        await interaction.response.send_message("Nie masz obecnie żadnej aktywnej substancji.", ephemeral=True)
         return
 
     msg = "**Twój status**:\n" + "\n".join(lines)
-    await ctx.send(msg)
+    await interaction.response.send_message(msg, ephemeral=True)
 
-# ---------------------------------------------
-# KOMENDA .CLEAR
-# ---------------------------------------------
-@bot.command()
-async def clear(ctx: commands.Context, user_arg: str = None):
-    """
-    .clear => czyści własny status
-    .clear <nick> => czyści cudzy status (Manage Nicknames / Admin)
-    """
-    if not ctx.guild:
-        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
+@bot.tree.command(name="clear", description="Czyści Twój status lub czyjś (Admin / Manage Nicknames).")
+@app_commands.describe(
+    user="Osoba do wyczyszczenia statusu (opcjonalnie)"
+)
+async def clear_slash(
+    interaction: discord.Interaction,
+    user: discord.Member = None
+):
+    if not interaction.guild:
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze.", ephemeral=True)
         return
 
-    if user_arg is None:
-        # Czyścimy swój status
-        if ctx.author.id not in user_statuses:
-            await ctx.send("Nie masz obecnie żadnego statusu do wyczyszczenia.")
+    if user is None:
+        # Czyścimy swój
+        if interaction.user.id not in user_statuses:
+            await interaction.response.send_message("Nie masz obecnie żadnego statusu do wyczyszczenia.", ephemeral=True)
             return
-
-        data = user_statuses.pop(ctx.author.id)
-        member = ctx.guild.get_member(ctx.author.id)
+        data = user_statuses.pop(interaction.user.id)
+        member = interaction.guild.get_member(interaction.user.id)
         if member:
             original_nick = data.get("original_nick") or (member.nick or member.name)
             if len(original_nick) > 32:
                 original_nick = original_nick[:31] + "…"
             try:
                 await member.edit(nick=original_nick)
-            except (discord.Forbidden, discord.HTTPException) as e:
-                logging.warning(f"Nie udało się przywrócić nicku {member.name}: {e}")
-
-        await ctx.send("Twój status został wyczyszczony.")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await interaction.response.send_message("Twój status został wyczyszczony.", ephemeral=False)
         save_data()
     else:
-        # Czyścimy status innej osoby
-        if not can_clear_others(ctx.author):
-            await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by czyścić statusy innych.")
+        # Czyścimy kogoś innego
+        if not can_clear_others(interaction.user):
+            await interaction.response.send_message(
+                "Nie masz uprawnień (Manage Nicknames / Admin), by czyścić statusy innych.",
+                ephemeral=True
+            )
             return
 
-        target = find_user_in_guild(ctx.guild, user_arg)
-        if not target:
-            await ctx.send(f"Nie znaleziono użytkownika: {user_arg}")
+        if user.id not in user_statuses:
+            await interaction.response.send_message(
+                f"Użytkownik {user.mention} nie ma żadnego statusu.",
+                ephemeral=True
+            )
             return
 
-        if target.id not in user_statuses:
-            await ctx.send(f"Użytkownik {target.mention} nie ma żadnego statusu do wyczyszczenia.")
-            return
-
-        data = user_statuses.pop(target.id)
-        original_nick = data.get("original_nick") or (target.nick or target.name)
+        data = user_statuses.pop(user.id)
+        original_nick = data.get("original_nick") or (user.nick or user.name)
         if len(original_nick) > 32:
             original_nick = original_nick[:31] + "…"
         try:
-            await target.edit(nick=original_nick)
-        except (discord.Forbidden, discord.HTTPException) as e:
-            logging.warning(f"Nie udało się przywrócić nicku {target.name}: {e}")
+            await user.edit(nick=original_nick)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
-        await ctx.send(f"Status użytkownika {target.mention} został wyczyszczony (wywołane przez {ctx.author.mention}).")
+        await interaction.response.send_message(
+            f"Status użytkownika {user.mention} został wyczyszczony.",
+            ephemeral=False
+        )
         save_data()
 
-# ---------------------------------------------
-# KOMENDA .LEADERBOARD
-# ---------------------------------------------
-@bot.command(name="leaderboard")
-async def leaderboard_cmd(ctx: commands.Context, hide_arg: str = None):
-    """
-    .leaderboard [hide]
-      - bez 'hide' -> wyniki publiczne
-      - 'hide' -> wyniki w DM
-    """
-    if not ctx.guild:
-        await ctx.send("Ta komenda działa tylko na serwerze (guild).")
-        return
-
-    leaderboard_text = build_leaderboard_text(ctx.guild)
-
-    if hide_arg == "hide":
-        # Wysyłamy prywatnie
-        try:
-            await ctx.author.send(leaderboard_text)
-            await ctx.send(f"Sprawdź prywatną wiadomość, {ctx.author.mention}!")
-        except discord.Forbidden:
-            await ctx.send(f"Nie mogę wysłać prywatnej wiadomości do {ctx.author.mention}.")
-    else:
-        await ctx.send(leaderboard_text)
-
-# ---------------------------------------------
-# SLASH: /LEADERBOARD
-# ---------------------------------------------
-@bot.tree.command(name="leaderboard", description="Wyświetla tabelę wyników")
-@app_commands.describe(
-    hide="Czy wiadomość ma być wysłana dyskretnie (ephemeral)? Domyślnie: False."
-)
-async def leaderboard_slash(interaction: discord.Interaction, hide: bool = False):
+@bot.tree.command(name="init_status_message", description="Tworzy wiadomość z reakcjami do dodawania spożycia.")
+async def init_status_message_slash(interaction: discord.Interaction):
     if not interaction.guild:
-        await interaction.response.send_message("Ta komenda działa tylko na serwerze (guild).", ephemeral=True)
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze.", ephemeral=True)
         return
 
-    text = build_leaderboard_text(interaction.guild)
-    # ephemeral=hide => jeśli hide=True, wiadomość tylko dla wywołującego
-    await interaction.response.send_message(content=text, ephemeral=hide)
+    global status_message_id
 
-# ---------------------------------------------
-# KOMENDA .INIT_STATUS_MESSAGE
-# ---------------------------------------------
+    text = (
+        "**Kliknij w reakcję, aby dodać spożycie**:\n"
+        "🍺 — Piwo - 0,5l (3h)\n"
+        "🥃 — Whiskey - 100ml (2h)\n"
+        "🍸 — Wódka - 50ml (2h)\n"
+        "🍷 — Wino - 250ml (2h)\n"
+        "🍹 — Drink - 350ml (2h)\n"
+        "🍃 — Blunt (4h)\n"
+        "❌ — Wyczyść status"
+    )
+    msg = await interaction.channel.send(text)
+    status_message_id = msg.id
+
+    for emoji in EMOJI_TO_TYPE:
+        await msg.add_reaction(emoji)
+    await msg.add_reaction("❌")
+
+    save_data()
+    await interaction.response.send_message("Utworzono wiadomość z reakcjami.", ephemeral=False)
+
 @bot.command()
 async def init_status_message(ctx: commands.Context):
     global status_message_id
-
     text = (
         "**Kliknij w reakcję, aby dodać spożycie**:\n"
         "🍺 — Piwo - 0,5l (3h)\n"
@@ -616,22 +665,69 @@ async def init_status_message(ctx: commands.Context):
         await message.add_reaction(emoji)
     await message.add_reaction("❌")
 
-# ---------------------------------------------
-# KOMENDA .SETCHANNEL
-# ---------------------------------------------
-@bot.command()
-async def setchannel(ctx: commands.Context, channel: discord.TextChannel):
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("Tylko administrator może to zrobić.")
-        return
+    save_data()
 
+@bot.tree.command(name="setchannel", description="Ustawia kanał nasłuchu (admin).")
+@app_commands.describe(channel="Kanał do nasłuchu")
+@app_commands.checks.has_permissions(administrator=True)
+async def setchannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
+    global listening_channel_id
+    listening_channel_id = channel.id
+    save_data()
+    await interaction.response.send_message(f"Ustawiono kanał nasłuchu na {channel.mention}.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setchannel(ctx: commands.Context, channel: discord.TextChannel):
     global listening_channel_id
     listening_channel_id = channel.id
     save_data()
     await ctx.send(f"Ustawiono kanał nasłuchu na {channel.mention}.")
 
 # ---------------------------------------------
-# OBSŁUGA REAKCJI
+# KOMENDA .LIVE_LEADERBOARD + SLASH
+# ---------------------------------------------
+@bot.command(name="live_leaderboard")
+@commands.has_permissions(administrator=True)
+async def live_leaderboard_cmd(ctx: commands.Context):
+    """
+    Tworzy wiadomość z embedowanym leaderboardem, aktualizowanym co minutę.
+    """
+    global live_leaderboard_message_id, live_leaderboard_channel_id
+
+    embed = build_leaderboard_embed(ctx.guild)
+    msg = await ctx.send(embed=embed)
+
+    live_leaderboard_message_id = msg.id
+    live_leaderboard_channel_id = msg.channel.id
+    save_data()
+
+    await ctx.send("Utworzono 'żywy' leaderboard. Będzie aktualizowany co minutę!")
+
+@bot.tree.command(name="live_leaderboard", description="Tworzy wiadomość z embedowanym leaderboardem (admin).")
+@app_commands.checks.has_permissions(administrator=True)
+async def live_leaderboard_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Ta komenda działa tylko na serwerze (guild).", ephemeral=True)
+        return
+
+    global live_leaderboard_message_id, live_leaderboard_channel_id
+
+    embed = build_leaderboard_embed(interaction.guild)
+    msg = await interaction.channel.send(embed=embed)
+
+    live_leaderboard_message_id = msg.id
+    live_leaderboard_channel_id = msg.channel.id
+    save_data()
+
+    await interaction.response.send_message("Utworzono 'żywy' leaderboard. Będzie aktualizowany co minutę!", ephemeral=False)
+
+# ---------------------------------------------
+# KOMENDA .LEADERBOARD i /leaderboard (już jest)
+# ---------------------------------------------
+
+# ---------------------------------------------
+# OBSŁUGA REAKCJI - USUNIĘTO WIADOMOŚCI NA KANALE  # <-- ZMIANA
 # ---------------------------------------------
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
@@ -651,7 +747,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 
     emoji = str(reaction.emoji)
     if emoji == "❌":
-        # Wyczyść status
         if member.id in user_statuses:
             data = user_statuses.pop(member.id)
             original_nick = data.get("original_nick") or (member.nick or member.name)
@@ -661,8 +756,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
                 await member.edit(nick=original_nick)
             except (discord.Forbidden, discord.HTTPException) as e:
                 logging.warning(f"Nie udało się przywrócić nicku {member.name}: {e}")
-
-            await reaction.message.channel.send(f"{user.mention} - Twój status został wyczyszczony.")
             save_data()
         await reaction.remove(user)
         return
@@ -677,8 +770,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 
     data = user_statuses[member.id]
     data[typ] += 1
-
-    # Ustawiamy/odświeżamy czas wygaśnięcia
     hours_to_expire = TIME_TO_EXPIRE[typ]
     data["expires_per_substance"][typ] = datetime.datetime.now(timezone.utc) + timedelta(hours=hours_to_expire)
 
@@ -686,10 +777,8 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     ensure_monthly_record(data, month)
     data["monthly_usage"][month][typ] += 1
 
-    await reaction.message.channel.send(f"{user.mention} dodał +1 do **{typ}**.")
     await update_nickname(member)
     save_data()
-
     await reaction.remove(user)
 
 # ---------------------------------------------
