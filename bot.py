@@ -1,5 +1,7 @@
 import os
+from dotenv import load_dotenv
 import json
+import math
 import logging
 import datetime
 from datetime import timezone, timedelta
@@ -23,22 +25,32 @@ intents.message_content = True
 intents.reactions = True
 intents.members = True  # Pamiętaj o włączeniu w panelu Discord: Privileged Gateway Intents
 
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents,help_command=None)
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
 
 VALID_TYPES = {"piwo", "wodka", "whiskey", "inne", "blunt"}
+
+# Czas (w godzinach) po jakim "schodzi" ostatnio dodana porcja danego typu:
+TIME_TO_EXPIRE = {
+    "piwo": 3,     # ~3h
+    "wodka": 2,    # ~2h
+    "whiskey": 2,  # ~2h
+    "inne": 2,     # np. wino ~2h
+    "blunt": 4     # ~4h
+}
+
 EMOJI_TO_TYPE = {
     "🍺": "piwo",
     "🥃": "whiskey",
     "🍸": "wodka",
     "🍷": "inne",
-    "🚬": "blunt"
+    "🍃": "blunt"
 }
 TYPE_TO_EMOJI = {v: k for k, v in EMOJI_TO_TYPE.items()}
 
 # ---------------------------------------------
 # DANE I ZMIENNE
 # ---------------------------------------------
-user_statuses = {}           # {user_id: {...}}
+user_statuses = {}           # { user_id: {...} }
 status_message_id = None     # do init_status_message
 listening_channel_id = None  # None => bot słucha wszędzie
 
@@ -75,15 +87,15 @@ def load_data():
         except ValueError:
             continue
 
-        expires_str = data.get("expires")
-        if expires_str:
-            try:
-                dt = datetime.datetime.fromisoformat(expires_str)
-                data["expires"] = dt
-            except ValueError:
-                data["expires"] = datetime.datetime.now(timezone.utc) + timedelta(hours=8)
-        else:
-            data["expires"] = datetime.datetime.now(timezone.utc) + timedelta(hours=8)
+        # wczytujemy expires_per_substance
+        eps = data.get("expires_per_substance", {})
+        for typ, val in eps.items():
+            if val is not None:
+                try:
+                    eps[typ] = datetime.datetime.fromisoformat(val)
+                except ValueError:
+                    eps[typ] = None
+        data["expires_per_substance"] = eps
 
         temp_statuses[user_id] = data
 
@@ -95,8 +107,17 @@ def save_data():
     to_save = {"settings": {"listening_channel_id": listening_channel_id}}
     for user_id, data in user_statuses.items():
         data_copy = dict(data)
-        if isinstance(data.get("expires"), datetime.datetime):
-            data_copy["expires"] = data["expires"].isoformat()
+
+        # musimy przekształcić expires_per_substance na string
+        if "expires_per_substance" in data_copy:
+            eps_dict = {}
+            for typ, dt_value in data_copy["expires_per_substance"].items():
+                if isinstance(dt_value, datetime.datetime):
+                    eps_dict[typ] = dt_value.isoformat()
+                else:
+                    eps_dict[typ] = None
+            data_copy["expires_per_substance"] = eps_dict
+
         to_save[str(user_id)] = data_copy
 
     try:
@@ -110,6 +131,10 @@ def save_data():
 # FUNKCJE POMOCNICZE
 # ---------------------------------------------
 def create_new_status(original_nick: str) -> dict:
+    """
+    Tworzy nową strukturę statusu. Każda substancja = 0,
+    a expires_per_substance[typ] = None.
+    """
     return {
         "original_nick": original_nick,
         "piwo": 0,
@@ -117,8 +142,14 @@ def create_new_status(original_nick: str) -> dict:
         "whiskey": 0,
         "inne": 0,
         "blunt": 0,
-        "expires": datetime.datetime.now(timezone.utc) + timedelta(hours=8),
-        "monthly_usage": {}
+        "monthly_usage": {},
+        "expires_per_substance": {
+            "piwo": None,
+            "wodka": None,
+            "whiskey": None,
+            "inne": None,
+            "blunt": None
+        }
     }
 
 def get_current_month() -> str:
@@ -138,7 +169,7 @@ def ensure_monthly_record(data: dict, month: str):
 
 def build_usage_string(status_data: dict) -> str:
     """
-    Skrócona forma np. 🍺5🥃2.
+    Zwraca skróconą formę np. "🍺5🥃2", pomijając zera.
     """
     parts = []
     for typ in VALID_TYPES:
@@ -148,9 +179,9 @@ def build_usage_string(status_data: dict) -> str:
             parts.append(f"{emoji}{count}")
     return "".join(parts)
 
-async def update_nickname(member: discord.Member):
+async def update_nickname(member: discord.Member, source="command"):
     """
-    Modyfikuje pseudonim, np. "nick" na "nick 🍺5🥃2".
+    Modyfikuje nick użytkownika. Jeśli to właściciel serwera, wysyła mu DM z gotową komendą do wklejenia.
     """
     data = user_statuses.get(member.id)
     if not data:
@@ -167,13 +198,31 @@ async def update_nickname(member: discord.Member):
 
     try:
         await member.edit(nick=new_nick)
-    except (discord.Forbidden, discord.HTTPException) as e:
-        logging.warning(f"Nie udało się zmienić nicku {member.name}: {e}")
+    except discord.Forbidden:
+        if member.guild.owner_id == member.id:
+            try:
+                if source == "command":
+                    # Gotowa komenda dla właściciela do wklejenia na serwerze
+                    await member.send(
+                        f"🔔 **Propozycja zmiany nicku:** `{new_nick}`\n\n"
+                        f"👉 Użyj na serwerze gotowej komendy:\n"
+                        f"```/setnick \"{new_nick}\"```"
+                    )
+                elif source == "expire":
+                    # Po wygaśnięciu — gotowa komenda do przywrócenia
+                    await member.send(
+                        f"⏳ Czas dla Twojego statusu minął. Sugerowana nowa nazwa: `{new_nick}`\n\n"
+                        f"👉 Użyj na serwerze gotowej komendy:\n"
+                        f"```/setnick \"{new_nick}\"```"
+                    )
+            except discord.Forbidden:
+                logging.warning(f"Nie udało się wysłać DM do właściciela ({member.name}).")
+        else:
+            logging.warning(f"Nie udało się zmienić nicku dla {member.name}.")
+
+
 
 def find_user_in_guild(guild: discord.Guild, name_or_mention: str) -> discord.Member:
-    """
-    Znajduje użytkownika po wzmiance (np. <@123>), ID lub nazwie/nicku.
-    """
     if not guild:
         return None
 
@@ -212,14 +261,9 @@ def can_clear_others(member: discord.Member) -> bool:
         return True
     return member.guild_permissions.manage_nicknames
 
-# ---------------------------------------------
-# BUDOWANIE TEKSTU LEADERBOARD
-# ---------------------------------------------
 def build_leaderboard_text(guild: discord.Guild) -> str:
     current_month = get_current_month()
     usage_list = []
-
-    # Zbieramy dane z user_statuses
     for user_id, data in user_statuses.items():
         monthly_data = data.get("monthly_usage", {})
         stats = monthly_data.get(current_month, {})
@@ -227,7 +271,6 @@ def build_leaderboard_text(guild: discord.Guild) -> str:
         if total_used > 0:
             usage_list.append((user_id, stats, total_used))
 
-    # Sort malejąco
     usage_list.sort(key=lambda x: x[2], reverse=True)
 
     if not usage_list:
@@ -238,14 +281,12 @@ def build_leaderboard_text(guild: discord.Guild) -> str:
     for user_id, stats, total_used in usage_list:
         member = guild.get_member(user_id)
         mention_str = member.mention if member else f"<@{user_id}>"
-
         detail_parts = []
         for t in VALID_TYPES:
             val = stats.get(t, 0)
             if val > 0:
                 detail_parts.append(f"{TYPE_TO_EMOJI[t]}{val}")
         detail_str = "".join(detail_parts) or "Brak"
-
         lines.append(f"**{position})** {mention_str} ({detail_str}) - Suma: {total_used}")
         position += 1
 
@@ -253,7 +294,7 @@ def build_leaderboard_text(guild: discord.Guild) -> str:
     return f"**Tabela wyników za {current_month}**:\n{leaderboard_text}"
 
 # ---------------------------------------------
-# EVENT on_ready i pętla czyszcząca
+# EVENT on_ready + pętla czyszcząca
 # ---------------------------------------------
 @bot.event
 async def on_ready():
@@ -272,13 +313,32 @@ async def on_ready():
 async def clean_statuses():
     now = datetime.datetime.now(timezone.utc)
     to_remove = []
+
     for user_id, data in user_statuses.items():
-        if now > data["expires"]:
+        for t in VALID_TYPES:
+            count = data[t]
+            exp_time = data["expires_per_substance"].get(t)
+            if count > 0 and exp_time is not None:
+                if now > exp_time:
+                    data[t] = 0
+                    data["expires_per_substance"][t] = None
+
+                    member = bot.get_guild(data["guild_id"]).get_member(user_id)
+                    if member:
+                        if member.guild.owner_id == member.id:
+                            # Właściciel serwera – wysyłamy DM z aktualnym nickiem
+                            await update_nickname(member, source="expire")
+
+        # Jeśli wszystkie substancje są wyzerowane, usuwamy status
+        if all(data[sub] == 0 for sub in VALID_TYPES):
             to_remove.append(user_id)
-    for user_id in to_remove:
-        user_statuses.pop(user_id, None)
+
+    for uid in to_remove:
+        user_statuses.pop(uid, None)
+
     if to_remove:
         save_data()
+
 
 # ---------------------------------------------
 # EVENT: on_message (filtr kanału)
@@ -300,7 +360,7 @@ def get_help_text() -> str:
         f"{BOT_PREFIX}help - Wyświetla tę pomoc\n"
         f"{BOT_PREFIX}add <typ> <ilość> - Dodaje do Twojego statusu\n"
         f"{BOT_PREFIX}add <nick> <typ> <ilość> - Dodaje do cudzego statusu (wymaga Manage Nicknames / Admin)\n"
-        f"{BOT_PREFIX}status - Wyświetla Twój status\n"
+        f"{BOT_PREFIX}status - Wyświetla Twój status (z czasem do wygaśnięcia)\n"
         f"{BOT_PREFIX}clear [<nick>] - Czyści Twój status lub czyjś (Manage Nicknames / Admin)\n"
         f"{BOT_PREFIX}leaderboard [hide] - Wyświetla tabelę wyników; z 'hide' wyśle w DM\n"
         f"{BOT_PREFIX}init_status_message - Tworzy wiadomość z reakcjami\n"
@@ -324,10 +384,6 @@ async def help_slash_cmd(interaction: discord.Interaction):
 # ---------------------------------------------
 @bot.command()
 async def add(ctx: commands.Context, *args):
-    """
-    .add <typ> <ilość> - dodaje do Twojego statusu
-    .add <nick> <typ> <ilość> - dodaje do cudzego statusu (wymaga Manage Nicknames / Admin)
-    """
     if not ctx.guild:
         await ctx.send("Ta komenda działa tylko na serwerze (guild).")
         return
@@ -337,7 +393,6 @@ async def add(ctx: commands.Context, *args):
         member = ctx.guild.get_member(ctx.author.id)
     elif len(args) == 3:
         name_or_mention, typ, ilosc_str = args
-        # SPRAWDZAMY UPRAWNIENIA
         if not can_add_for_others(ctx.author):
             await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by dodawać innym.")
             return
@@ -349,10 +404,11 @@ async def add(ctx: commands.Context, *args):
         await ctx.send("Poprawne użycie: .add <typ> <ilość> lub .add <nick> <typ> <ilość>")
         return
 
+    # Konwersja ilości
     try:
         ilosc = int(ilosc_str)
     except ValueError:
-        await ctx.send("Podaj liczbę jako ilość, np. .add piwo 2 lub .add @Marcin piwo 2")
+        await ctx.send("Podaj liczbę jako ilość.")
         return
 
     typ = typ.lower()
@@ -365,7 +421,9 @@ async def add(ctx: commands.Context, *args):
 
     data = user_statuses[member.id]
     data[typ] += ilosc
-    data["expires"] = datetime.datetime.now(timezone.utc) + timedelta(hours=8)
+
+    hours_to_expire = TIME_TO_EXPIRE[typ]
+    data["expires_per_substance"][typ] = datetime.datetime.now(timezone.utc) + timedelta(hours=hours_to_expire)
 
     month = get_current_month()
     ensure_monthly_record(data, month)
@@ -374,11 +432,13 @@ async def add(ctx: commands.Context, *args):
     if member.id == ctx.author.id:
         await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {ctx.author.mention}.")
     else:
-        await ctx.send(
-            f"Dodano **{ilosc}** do **{typ}** dla użytkownika {member.mention} (wywołane przez {ctx.author.mention})."
-        )
-    await update_nickname(member)
+        await ctx.send(f"Dodano **{ilosc}** do **{typ}** dla {member.mention}.")
+
+    # Używamy poprawnej wartości "source"
+    await update_nickname(member, source="command")
     save_data()
+
+
 
 @add.error
 async def add_error(ctx: commands.Context, error):
@@ -393,25 +453,37 @@ async def add_error(ctx: commands.Context, error):
 # ---------------------------------------------
 @bot.command()
 async def status(ctx: commands.Context):
+    """
+    Wyświetla aktualne ilości i czas do wygaśnięcia każdej substancji > 0
+    """
     data = user_statuses.get(ctx.author.id)
     if not data:
         await ctx.send("Nie masz obecnie żadnego statusu.")
         return
 
+    lines = []
     now = datetime.datetime.now(timezone.utc)
-    expires_in = data["expires"] - now
-    hours, remainder = divmod(int(expires_in.total_seconds()), 3600)
-    minutes, _ = divmod(remainder, 60)
+    for t in VALID_TYPES:
+        count = data[t]
+        if count > 0:
+            # Obliczamy czas do wygaśnięcia:
+            exp_time = data["expires_per_substance"].get(t)
+            if exp_time:
+                diff = exp_time - now
+                diff_hours = diff.total_seconds() / 3600.0
+                # zaokrąglamy w górę do pełnych godzin:
+                hours_left = math.ceil(diff_hours)
+                lines.append(f"• {t.capitalize()}: {count} (pozostało ~{hours_left}h)")
+            else:
+                # Teoretycznie nie powinno się zdarzyć,
+                # ale gdyby count>0, a brak exp_time => brak czasu
+                lines.append(f"• {t.capitalize()}: {count} (czas nieustalony)")
 
-    msg = (
-        f"**Twój status**:\n"
-        f"• Piwo: {data['piwo']}\n"
-        f"• Wódka: {data['wodka']}\n"
-        f"• Whiskey: {data['whiskey']}\n"
-        f"• Inne: {data['inne']}\n"
-        f"• Blunty: {data['blunt']}\n\n"
-        f"Wygasa za: {hours}h {minutes}min."
-    )
+    if not lines:
+        await ctx.send("Nie masz obecnie żadnej aktywnej substancji.")
+        return
+
+    msg = "**Twój status**:\n" + "\n".join(lines)
     await ctx.send(msg)
 
 # ---------------------------------------------
@@ -420,15 +492,15 @@ async def status(ctx: commands.Context):
 @bot.command()
 async def clear(ctx: commands.Context, user_arg: str = None):
     """
-    .clear - czyści Twój status
-    .clear <nick> - czyści czyjś status (Manage Nicknames / Admin)
+    .clear => czyści własny status
+    .clear <nick> => czyści cudzy status (Manage Nicknames / Admin)
     """
     if not ctx.guild:
         await ctx.send("Ta komenda działa tylko na serwerze (guild).")
         return
 
-    # 1) Bez argumentu -> czyści własny status
     if user_arg is None:
+        # Czyścimy swój status
         if ctx.author.id not in user_statuses:
             await ctx.send("Nie masz obecnie żadnego statusu do wyczyszczenia.")
             return
@@ -446,43 +518,42 @@ async def clear(ctx: commands.Context, user_arg: str = None):
 
         await ctx.send("Twój status został wyczyszczony.")
         save_data()
-        return
+    else:
+        # Czyścimy status innej osoby
+        if not can_clear_others(ctx.author):
+            await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by czyścić statusy innych.")
+            return
 
-    # 2) Z argumentem -> czyścimy status innego usera (wymaga Manage Nicknames / Admin)
-    if not can_clear_others(ctx.author):
-        await ctx.send("Nie masz uprawnień (Manage Nicknames / Admin), by czyścić statusy innych.")
-        return
+        target = find_user_in_guild(ctx.guild, user_arg)
+        if not target:
+            await ctx.send(f"Nie znaleziono użytkownika: {user_arg}")
+            return
 
-    target = find_user_in_guild(ctx.guild, user_arg)
-    if not target:
-        await ctx.send(f"Nie znaleziono użytkownika: {user_arg}")
-        return
+        if target.id not in user_statuses:
+            await ctx.send(f"Użytkownik {target.mention} nie ma żadnego statusu do wyczyszczenia.")
+            return
 
-    if target.id not in user_statuses:
-        await ctx.send(f"Użytkownik {target.mention} nie ma żadnego statusu do wyczyszczenia.")
-        return
+        data = user_statuses.pop(target.id)
+        original_nick = data.get("original_nick") or (target.nick or target.name)
+        if len(original_nick) > 32:
+            original_nick = original_nick[:31] + "…"
+        try:
+            await target.edit(nick=original_nick)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"Nie udało się przywrócić nicku {target.name}: {e}")
 
-    data = user_statuses.pop(target.id)
-    original_nick = data.get("original_nick") or (target.nick or target.name)
-    if len(original_nick) > 32:
-        original_nick = original_nick[:31] + "…"
-    try:
-        await target.edit(nick=original_nick)
-    except (discord.Forbidden, discord.HTTPException) as e:
-        logging.warning(f"Nie udało się przywrócić nicku {target.name}: {e}")
-
-    await ctx.send(f"Status użytkownika {target.mention} został wyczyszczony (wywołane przez {ctx.author.mention}).")
-    save_data()
+        await ctx.send(f"Status użytkownika {target.mention} został wyczyszczony (wywołane przez {ctx.author.mention}).")
+        save_data()
 
 # ---------------------------------------------
-# KOMENDA .LEADERBOARD [HIDE]
+# KOMENDA .LEADERBOARD
 # ---------------------------------------------
 @bot.command(name="leaderboard")
 async def leaderboard_cmd(ctx: commands.Context, hide_arg: str = None):
     """
     .leaderboard [hide]
-      - bez hide -> wyniki publiczne
-      - z hide  -> wyniki w DM
+      - bez 'hide' -> wyniki publiczne
+      - 'hide' -> wyniki w DM
     """
     if not ctx.guild:
         await ctx.send("Ta komenda działa tylko na serwerze (guild).")
@@ -491,18 +562,17 @@ async def leaderboard_cmd(ctx: commands.Context, hide_arg: str = None):
     leaderboard_text = build_leaderboard_text(ctx.guild)
 
     if hide_arg == "hide":
-        # Wysyłamy na priv
+        # Wysyłamy prywatnie
         try:
             await ctx.author.send(leaderboard_text)
             await ctx.send(f"Sprawdź prywatną wiadomość, {ctx.author.mention}!")
         except discord.Forbidden:
             await ctx.send(f"Nie mogę wysłać prywatnej wiadomości do {ctx.author.mention}.")
     else:
-        # Publicznie
         await ctx.send(leaderboard_text)
 
 # ---------------------------------------------
-# SLASH: /LEADERBOARD (hide: bool)
+# SLASH: /LEADERBOARD
 # ---------------------------------------------
 @bot.tree.command(name="leaderboard", description="Wyświetla tabelę wyników")
 @app_commands.describe(
@@ -513,9 +583,9 @@ async def leaderboard_slash(interaction: discord.Interaction, hide: bool = False
         await interaction.response.send_message("Ta komenda działa tylko na serwerze (guild).", ephemeral=True)
         return
 
-    leaderboard_text = build_leaderboard_text(interaction.guild)
-    # ephemeral = hide => jeśli hide=True, wiadomość jest ukryta, widoczna tylko dla wywołującego
-    await interaction.response.send_message(content=leaderboard_text, ephemeral=hide)
+    text = build_leaderboard_text(interaction.guild)
+    # ephemeral=hide => jeśli hide=True, wiadomość tylko dla wywołującego
+    await interaction.response.send_message(content=text, ephemeral=hide)
 
 # ---------------------------------------------
 # KOMENDA .INIT_STATUS_MESSAGE
@@ -526,11 +596,11 @@ async def init_status_message(ctx: commands.Context):
 
     text = (
         "**Kliknij w reakcję, aby dodać spożycie**:\n"
-        "🍺 — Piwo\n"
-        "🥃 — Whiskey\n"
-        "🍸 — Wódka\n"
-        "🍷 — Inne\n"
-        "🚬 — Blunt\n"
+        "🍺 — Piwo (3h)\n"
+        "🥃 — Whiskey (2h)\n"
+        "🍸 — Wódka (2h)\n"
+        "🍷 — Inne (2h)\n"
+        "🍃 — Blunt (4h)\n"
         "❌ — Wyczyść status"
     )
     message = await ctx.send(text)
@@ -575,6 +645,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 
     emoji = str(reaction.emoji)
     if emoji == "❌":
+        # Wyczyść status
         if member.id in user_statuses:
             data = user_statuses.pop(member.id)
             original_nick = data.get("original_nick") or (member.nick or member.name)
@@ -600,7 +671,10 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 
     data = user_statuses[member.id]
     data[typ] += 1
-    data["expires"] = datetime.datetime.now(timezone.utc) + timedelta(hours=8)
+
+    # Ustawiamy/odświeżamy czas wygaśnięcia
+    hours_to_expire = TIME_TO_EXPIRE[typ]
+    data["expires_per_substance"][typ] = datetime.datetime.now(timezone.utc) + timedelta(hours=hours_to_expire)
 
     month = get_current_month()
     ensure_monthly_record(data, month)
@@ -609,10 +683,11 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     await reaction.message.channel.send(f"{user.mention} dodał +1 do **{typ}**.")
     await update_nickname(member)
     save_data()
+
     await reaction.remove(user)
 
 # ---------------------------------------------
-# PRZYKŁADOWA KOMENDA /ping
+# /PING
 # ---------------------------------------------
 @bot.tree.command(name="ping", description="Testowa komenda slash – odpowiada 'Pong!'")
 async def ping_slash(interaction: discord.Interaction):
@@ -622,5 +697,9 @@ async def ping_slash(interaction: discord.Interaction):
 # START BOTA
 # ---------------------------------------------
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN", "TWOJ_TOKEN_DISCORDA")
-    bot.run(token)
+    load_dotenv()
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if TOKEN is None:
+        logging.warning(f"Nie znaleziono DISCORD_TOKEN w .env. Wykorzystam TOKEN z kodu (NIEZALECANE)")
+        TOKEN = "TWOJ-TOKEN-TUTAJ-NIEZALECANE"
+    bot.run(TOKEN)
