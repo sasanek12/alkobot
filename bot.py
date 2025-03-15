@@ -27,14 +27,15 @@ intents.members = True  # Pamiętaj o włączeniu w panelu Discord: Privileged G
 
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
 
-VALID_TYPES = {"piwo", "wodka", "whiskey", "inne", "blunt"}
+VALID_TYPES = {"piwo", "wodka", "whiskey", "wino", "drink", "blunt"}
 
 # Czas (w godzinach) po jakim "schodzi" ostatnio dodana porcja danego typu:
 TIME_TO_EXPIRE = {
     "piwo": 3,     # ~3h
     "wodka": 2,    # ~2h
     "whiskey": 2,  # ~2h
-    "inne": 2,     # np. wino ~2h
+    "wino": 2,
+    "drink": 2, # np. wino ~2h
     "blunt": 4     # ~4h
 }
 
@@ -42,7 +43,8 @@ EMOJI_TO_TYPE = {
     "🍺": "piwo",
     "🥃": "whiskey",
     "🍸": "wodka",
-    "🍷": "inne",
+    "🍷": "wino",
+    "🍹": "drink",
     "🍃": "blunt"
 }
 TYPE_TO_EMOJI = {v: k for k, v in EMOJI_TO_TYPE.items()}
@@ -140,14 +142,16 @@ def create_new_status(original_nick: str) -> dict:
         "piwo": 0,
         "wodka": 0,
         "whiskey": 0,
-        "inne": 0,
+        "wino": 0,
+        "drink": 0,
         "blunt": 0,
         "monthly_usage": {},
         "expires_per_substance": {
             "piwo": None,
             "wodka": None,
             "whiskey": None,
-            "inne": None,
+            "wino": None,
+            "drink": None,
             "blunt": None
         }
     }
@@ -163,7 +167,8 @@ def ensure_monthly_record(data: dict, month: str):
             "piwo": 0,
             "wodka": 0,
             "whiskey": 0,
-            "inne": 0,
+            "wino": 0,
+            "drink": 0,
             "blunt": 0
         }
 
@@ -596,10 +601,11 @@ async def init_status_message(ctx: commands.Context):
 
     text = (
         "**Kliknij w reakcję, aby dodać spożycie**:\n"
-        "🍺 — Piwo (3h)\n"
-        "🥃 — Whiskey (2h)\n"
-        "🍸 — Wódka (2h)\n"
-        "🍷 — Inne (2h)\n"
+        "🍺 — Piwo - 0,5l (3h)\n"
+        "🥃 — Whiskey - 100ml (2h)\n"
+        "🍸 — Wódka - 50ml (2h)\n"
+        "🍷 — Wino - 250ml (2h)\n"
+        "🍹 — Drink - 350ml (2h)\n"
         "🍃 — Blunt (4h)\n"
         "❌ — Wyczyść status"
     )
